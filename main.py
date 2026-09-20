@@ -16,8 +16,27 @@ from database import (
     add_user,
     get_link_status,
     disable_link,
-    enable_link
+    enable_link,
+    save_anonymous_message,
+    get_anonymous_sender
 )
+
+# slowmode settings
+import time
+
+SLOWMODE_SECONDS = 9
+last_message_time = {}
+
+def get_slowmode_remaining(user_id: int):
+    now = time.monotonic()
+    last_time = last_message_time.get(user_id)
+
+    if last_time is None:
+        return 0
+
+    remaining = SLOWMODE_SECONDS - (now - last_time)
+
+    return max(0, remaining)
 
 # preload TOKEN from .env
 from dotenv import load_dotenv
@@ -36,6 +55,8 @@ dp = Dispatcher()
 class AnonymousMessage(StatesGroup):
     waiting_for_message = State()
 
+class AnonymousReply(StatesGroup):
+    waiting_for_reply = State()
 
 # inline-btns
 stopsendbtn = InlineKeyboardMarkup(
@@ -49,6 +70,16 @@ stopsendbtn = InlineKeyboardMarkup(
     ]
 )
 
+replybtn = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="Ответить",
+                callback_data="reply_anonymous"
+            )
+        ]
+    ]
+)
 
 def link_control_keyboard(is_active: bool):
     if is_active:
@@ -119,6 +150,12 @@ async def startmsg(
             await message.answer("Некорректная ссылка.")
             return
 
+        if recipient_id == message.from_user.id:
+            await message.answer(
+                "Нельзя отправлять анонимные сообщения самому себе."
+            )
+            return
+
         is_active, _ = await get_link_status(recipient_id)
 
         if is_active is None:
@@ -166,6 +203,73 @@ async def startmsg(
             reply_markup=stopsendbtn
         )
 
+@dp.message(Command("reply"))
+async def reply_command(message: types.Message, state: FSMContext):
+    if not message.reply_to_message:
+        await message.answer(
+            "Используй /reply для ответа на анонимное сообщение."
+        )
+        return
+
+    sender_id = await get_anonymous_sender(
+        recipient_id=message.from_user.id,
+        message_id=message.reply_to_message.message_id
+    )
+
+    if sender_id is None:
+        await message.answer(
+            "Не удалось найти отправителя этого сообщения."
+        )
+        return
+
+    await state.update_data(
+        reply_recipient_id=sender_id
+    )
+
+    await state.set_state(
+        AnonymousReply.waiting_for_reply
+    )
+
+    await message.answer(
+        "Напиши ответ. Для отмены используй /cancel."
+    )
+
+@dp.message(Command("cancel"))
+async def cancel_command(message: types.Message, state: FSMContext):
+    await state.clear()
+
+    await message.answer(
+        "Вы вышли из режима ответа."
+    )
+
+@dp.message(AnonymousReply.waiting_for_reply, F.text)
+async def anonymous_reply(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    reply_recipient_id = data.get("reply_recipient_id")
+
+    if not reply_recipient_id:
+        await message.answer(
+            "Не удалось определить получателя ответа."
+        )
+        await state.clear()
+        return
+
+    sent_message = await bot.send_message(
+        chat_id=reply_recipient_id,
+        text=f"↩️ Ответ на твоё сообщение!\n\n— {message.text}"
+    )
+
+    await save_anonymous_message(
+        recipient_id=reply_recipient_id,
+        message_id=sent_message.message_id,
+        sender_id=message.from_user.id
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "Ответ успешно отправлен!"
+    )
 
 @dp.message(AnonymousMessage.waiting_for_message, F.text)
 async def anonymous_message(
@@ -175,19 +279,36 @@ async def anonymous_message(
     data = await state.get_data()
     recipient_id = data.get("recipient_id")
 
+    if not recipient_id:
+        await message.answer(
+            "Сообщение не было отправлено – не удалось определить получателя."
+        )
+        return
+
+    remaining = get_slowmode_remaining(message.from_user.id)
+
+    if remaining > 0:
+        await message.answer(
+            f"Подожди ещё {int(remaining) + 1} сек. перед следующим сообщением."
+        )
+        return
+
+    last_message_time[message.from_user.id] = time.monotonic()
+
     if recipient_id:
-        await bot.send_message(
+        sent_message = await bot.send_message(
             chat_id=recipient_id,
-            text=f"✨ Новое сообщение! \n\n— {message.text}"
+            text=f"✨ Новое сообщение! \n\n— {message.text}",
+            reply_markup=replybtn
+        )
+
+        await save_anonymous_message(
+            recipient_id=recipient_id,
+            message_id=sent_message.message_id,
+            sender_id=message.from_user.id
         )
 
         await message.answer("Сообщение успешно отправлено!")
-
-    else:
-        await message.answer(
-            "Не удалось определить получателя сообщения."
-        )
-
 
 @dp.message(AnonymousMessage.waiting_for_message, F.photo)
 async def anonymous_message_with_photo(
@@ -197,18 +318,40 @@ async def anonymous_message_with_photo(
     data = await state.get_data()
     recipient_id = data.get("recipient_id")
 
+    if not recipient_id:
+        await message.answer(
+            "Сообщение не было отправлено – не удалось определить получателя."
+        )
+        return
+
+    remaining = get_slowmode_remaining(message.from_user.id)
+
+    if remaining > 0:
+        await message.answer(
+            f"Подожди ещё {int(remaining) + 1} сек. перед следующим сообщением."
+        )
+        return
+
+    last_message_time[message.from_user.id] = time.monotonic()
+
     photo = message.photo[-1]
 
     if recipient_id:
-        await bot.send_photo(
+        sent_message = await bot.send_photo(
             chat_id=recipient_id,
             photo=photo.file_id,
             caption=f"✨ Новое сообщение! \n\n{message.caption or ''}",
-            has_spoiler=True
+            has_spoiler=True,
+            reply_markup=replybtn
+        )
+
+        await save_anonymous_message(
+            recipient_id=recipient_id,
+            message_id=sent_message.message_id,
+            sender_id=message.from_user.id
         )
 
         await message.answer("Сообщение успешно отправлено!")
-
 
 @dp.message(AnonymousMessage.waiting_for_message)
 async def unsupported_message(message: types.Message):
@@ -216,6 +359,33 @@ async def unsupported_message(message: types.Message):
         "Можно отправлять только текст и фотографии."
     )
 
+@dp.callback_query(F.data == "reply_anonymous")
+async def reply_button(callback: CallbackQuery, state: FSMContext):
+    sender_id = await get_anonymous_sender(
+        recipient_id=callback.from_user.id,
+        message_id=callback.message.message_id
+    )
+
+    if sender_id is None:
+        await callback.answer(
+            "Не удалось найти отправителя.",
+            show_alert=True
+        )
+        return
+
+    await state.update_data(
+        reply_recipient_id=sender_id
+    )
+
+    await state.set_state(
+        AnonymousReply.waiting_for_reply
+    )
+
+    await callback.answer()
+
+    await callback.message.answer(
+        "Напиши ответ. Для отмены используй /cancel."
+    )
 
 @dp.callback_query(F.data == "stopsendmsgs")
 async def stop_sending(

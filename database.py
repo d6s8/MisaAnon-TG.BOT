@@ -13,6 +13,15 @@ async def init_db():
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS anonymous_messages (
+                recipient_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                PRIMARY KEY (recipient_id, message_id)
+            )
+        """)
+
         await db.commit()
 
 async def add_user(user_id: int):
@@ -29,6 +38,43 @@ async def add_user(user_id: int):
 
 import time
 
+async def save_anonymous_message(
+    recipient_id: int,
+    message_id: int,
+    sender_id: int
+):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO anonymous_messages
+            (recipient_id, message_id, sender_id)
+            VALUES (?, ?, ?)
+            """,
+            (recipient_id, message_id, sender_id)
+        )
+
+        await db.commit()
+
+async def get_anonymous_sender(
+    recipient_id: int,
+    message_id: int
+):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            """
+            SELECT sender_id
+            FROM anonymous_messages
+            WHERE recipient_id = ? AND message_id = ?
+            """,
+            (recipient_id, message_id)
+        )
+
+        row = await cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return row[0]
 
 async def get_link_status(user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
